@@ -37,16 +37,17 @@ const USE_AUTO_STOP_DELAY = 40;
  * 中途松开 = 取消进食（食物不消耗）。取 80tick(≈4s) 保证所有食物完整吃完再停。
  */
 const USE_FOOD_STOP_DELAY = 80;
+const continuousUseBots = new Set<string>();
 
 /** 找一个当前可用的物品槽位：优先当前选中的手；其次快捷栏第一个非空 */
-function findUsableSlot(sim: SimulatedPlayer): number {
+function findUsableSlot(sim: SimulatedPlayer, allowFallback = true): number {
   try {
     // ⚠️ 组件 ID 必须带 minecraft: 前缀（不带前缀的调用返回 undefined，容器永远拿不到）
     const container = (sim.getComponent("minecraft:inventory") as
       | { container?: { getItem: (i: number) => unknown } }
       | undefined)?.container;
     const sel = sim.selectedSlotIndex ?? 0;
-    if (container?.getItem(sel)) return sel;
+    if (container?.getItem(sel) || !allowFallback) return sel;
     for (let i = 0; i < 9; i++) {
       if (container?.getItem(i)) return i;
     }
@@ -115,7 +116,7 @@ export enum UseItemResult {
  * - 弓/弩：满蓄力后自动松开发射；投掷类（药水/附魔瓶/三叉戟）：蓄力片刻后自动抛出
  * @returns 多状态结果（见 UseItemResult 枚举），永不 reject
  */
-export function useItemOnce(record: BotRecord, player?: Player): Promise<UseItemResult> {
+export function useItemOnce(record: BotRecord, player?: Player, allowFallback = true): Promise<UseItemResult> {
   const sim = resolveBotPlayer(record.name);
   if (!sim) {
     console.warn(`[MockPlayer] 使用物品：${record.name} 不在线`);
@@ -126,7 +127,7 @@ export function useItemOnce(record: BotRecord, player?: Player): Promise<UseItem
       try {
         // ⚠️ 实体有效性防护：死亡/下线/重连瞬间实体失效，useItemInSlot 会抛 "entity being invalid"
         if (!sim.isValid) { resolve(UseItemResult.EntityInvalid); return; }
-        const slot = findUsableSlot(sim);
+        const slot = findUsableSlot(sim, allowFallback);
         const item = slotItemType(sim, slot);
         const food = isFoodItem(sim, slot);
 
@@ -178,6 +179,26 @@ export function startUseItem(player: Player, record: BotRecord): void {
   void useItemOnce(record, player);
 }
 
+async function continuousUseLoop(botName: string): Promise<void> {
+  if (!continuousUseBots.has(botName)) return;
+  const record = botRegistry.get(botName);
+  if (!record) { continuousUseBots.delete(botName); return; }
+  await useItemOnce(record, undefined, false);
+  if (continuousUseBots.has(botName)) system.run(() => { void continuousUseLoop(botName); });
+}
+
+function toggleContinuousUse(player: Player, record: BotRecord): void {
+  if (continuousUseBots.has(record.name)) {
+    continuousUseBots.delete(record.name);
+    stopUseItem(player, record);
+    player.sendMessage(`${color.success}${record.name} 已停止一直使用物品`);
+  } else {
+    continuousUseBots.add(record.name);
+    player.sendMessage(`${color.success}${record.name} 已开始一直使用物品`);
+    void continuousUseLoop(record.name);
+  }
+}
+
 /**
  * 停止使用主手物品（松开）：
  * - 弓：完成蓄力松开发射；投掷类（药水/附魔瓶/三叉戟）：抛出
@@ -185,6 +206,7 @@ export function startUseItem(player: Player, record: BotRecord): void {
  * - 无进行中的使用：no-op，安全
  */
 export function stopUseItem(player: Player, record: BotRecord): void {
+  continuousUseBots.delete(record.name);
   const sim = resolveBotPlayer(record.name);
   if (!sim) {
     console.warn(`[MockPlayer] 停止使用：${record.name} 不在线，仅保存开关状态`);
@@ -208,12 +230,13 @@ export function stopUseItem(player: Player, record: BotRecord): void {
 /** 订阅主菜单“使用物品”按钮 → 直接使用一次主手物品 */
 function registerPanelAction(): void {
   BotUiEvent.panelAction.subscribe((e) => {
-    if (e.action !== "useItem") return;
+    if (e.action !== "useItem" && e.action !== "continuousUseItem") return;
     const record = botRegistry.get(e.botName);
     if (!record) return;
     const player = world.getEntity(e.playerId) as Player | undefined;
     if (!player) return;
-    startUseItem(player, record);
+    if (e.action === "continuousUseItem") toggleContinuousUse(player, record);
+    else startUseItem(player, record);
   });
 }
 
